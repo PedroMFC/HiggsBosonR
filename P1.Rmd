@@ -1,0 +1,432 @@
+---
+title: "Práctica 1. Pre-procesamiento de datos y clasificación binaria"
+author: "Pedro Manuel Flores Crespo"
+output:
+  html_notebook: 
+    toc: yes
+    html_document: 
+      toc: yes
+      number_sections: yes
+      code_folding: show
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE)
+library(knitr)
+library(tidyverse)
+library(funModeling)
+library(DataExplorer)
+library(shiny)
+library(BBmisc)
+library(corrplot)
+library(caret)
+library(discretization)
+library(mice)
+library(caretEnsemble)
+library(randomForest)
+library(pROC)
+library(rpart.plot)
+# library(ggbiplot)
+# library(devtools)
+library(xgboost)
+set.seed(23)
+```
+
+# EDA y visualización
+
+Tomado de *higgs-eda.Rmd* disponible en el repositorio de la asignatura.
+
+## Descarga de datos
+
+```{r descargar}
+if(!file.exists("data/training.csv")) {
+  library(httr)  
+  url <- "http://sl.ugr.es/higgs_sige"
+  GET(url, write_disk(temp <- tempfile(fileext = ".zip")))
+  unzip(temp, exdir = "data")
+  unlink(temp)
+}
+```
+
+## Lectura de datos
+
+Datos de entrenamiento:
+
+```{r leer-entrenamiento}
+data_raw <- read_csv("data/training.csv")
+data_raw
+```
+
+Antes de comenzar, se recodifican los valores perdidos como `NA`:
+
+```{r recodificar}
+data <- data_raw %>%
+  # mutate(Label = ifelse(Label == 's', 1, 0)) %>%
+  na_if(-999.0)
+```
+
+Y eleminamos las columnas *weight* y el Identificador
+
+```{r eliminar ID-weight}
+data <- data %>%
+  select(-one_of('Weight', 'EventId'))
+status <- df_status(data)
+```
+
+## Análisis de las clases
+
+```{r clases num, warning=FALSE}
+table(data$Label)
+```
+
+```{r clases plot, warning=FALSE}
+ggplot(training_data) +
+  geom_histogram(aes(x = Label, fill = as.factor(Label)), stat = "count") +
+  labs(x = "", y = "") +
+  scale_fill_discrete(name ="Clase", labels=c("(b)ackground", "higg(s)"))
+```
+
+Utilizando [Shiny](https://shiny.rstudio.com/), se puede extender para todas las variables (sin `NA`s).
+
+```{r densidad-interactiva, echo=FALSE}
+cols <- training_data %>%
+  select_if(~ !any(is.na(.))) %>%
+  select(starts_with(c("DER", "PRI"))) %>%
+  names() %>%
+  sort()
+
+inputPanel(
+  selectInput("x_variable", label = "Variable x:",
+              choices = cols, 
+              selected = cols[1])
+)
+
+renderPlot({
+  ggplot(training_data) + 
+    geom_density(aes_string(x = input$x_variable, fill = "Label", color = "Label"), alpha = 0.3) +
+    labs(x = "", y = "") +
+    scale_fill_discrete(name ="Clase", labels=c("(b)ackground", "higg(s)")) +
+    scale_color_discrete(name ="Clase", labels=c("(b)ackground", "higg(s)"))
+})
+
+renderUI({
+  HTML(paste0(
+    "<p>Correlacion con objetivo de clasificación: <b>",
+    cor(training_data[input$x_variable], as.numeric(factor(training_data$Label))),
+    "</b></p>"
+  ))
+})
+```
+
+## Análisis exploratorio con DataExplorer
+
+[DataExplorer](https://boxuancui.github.io/DataExplorer/) permite crear un informe de un conjunto de datos incluyendo varios gráficos exploratorios.
+
+```{r generar-informe, include=FALSE}
+create_report(training_data)
+```
+
+# Preprocesamiento
+
+## Eliminar columnas que no son útiles
+
+```{r no útiles}
+status <- status %>% 
+  filter(variable != 'Label')
+```
+
+```{r útiles NA}
+na_cols <- status %>%
+  filter(p_na > 70) %>%
+  select(variable)
+```
+
+```{r útiles eliminar}
+remove_cols <- bind_rows(
+  list(
+    na_cols
+  )
+)
+
+data <- data %>%
+  select(-one_of(remove_cols$variable))
+```
+
+```{r útiles fin}
+status <- df_status(data)
+```
+
+## Imputar valores perdidos
+
+```{r imputar valores perdidos}
+imputacion <- mice(data, method = "mean")
+```
+
+```{r imputar valores perdidos 2}
+imputacion
+```
+
+```{r imputar valores perdidos 3}
+data_imp <- complete(imputacion)
+head(data_imp)
+```
+
+## Discretización de datos
+
+```{r discretizar-get-names}
+names <- data_imp %>%
+        select(starts_with(c("DER", "PRI"))) %>%
+        names()
+```
+
+```{r discretizar bins}
+d_bins
+```
+
+```{r discretizar get-bins}
+d_bins=discretize_get_bins(data=data_imp, input=names, n_bins=12)
+```
+
+```{r discretizar apply}
+data_dis =discretize_df(data=data_imp, 
+    data_bins=d_bins,
+    stringsAsFactors=T)
+```
+
+```{r discretizar as.numeric}
+data_dis <- data_dis %>%
+  mutate_if(is.factor, as.numeric) %>%
+  mutate_if(is.character, as.factor) # Variable como factor no character
+
+```
+
+```{r discretizar head}
+head(data_dis)
+```
+
+## Selección de instancias mediante *downsampling*
+
+```{r selec-ins 1}
+predictors <- select(data_dis, -Label)
+data_down <- downSample(x = predictors, y = data_dis$Label, yname = 'Label')
+table(data_down$Label)
+```
+
+```{r training-val}
+trainIndex <- createDataPartition(data_down$Label, p = .75, list = FALSE)
+train <- data_down[ trainIndex, ] 
+val   <- data_down[-trainIndex, ]
+```
+
+```{r talbe-train}
+table(train$Label)
+```
+
+```{r talbe-val}
+table(val$Label)
+```
+
+## Selección de variables
+
+### Selección de variables por correlación
+
+```{r selec-var}
+data_selec <- train %>%
+  select(starts_with(c("DER", "PRI")))
+rcorr_result <- rcorr(as.matrix(data_selec))
+cor_matrix <- as.tibble(rcorr_result$r, rownames = "variable")
+corrplot(rcorr_result$r, type = "upper", order = "original", tl.col = "black", tl.srt = 45)
+```
+
+```{r selec-va pearson}
+v <- varclus(as.matrix(data_selec), similarity="pearson") 
+plot(v)
+```
+
+```{r selec-va cutree}
+groups <- cutree(v$hclust, 8)
+```
+
+```{r selec-va representativa}
+not_correlated_vars <- enframe(groups) %>% 
+  group_by(value) %>% 
+  sample_n(1)
+
+train_sel <- train %>%
+  select(one_of(not_correlated_vars$name))
+train_sel$Label <- as.factor(train$Label) # La metemos de nuevo
+head(train_sel)
+```
+
+```{r crear val}
+val_sel <- val %>%
+  select(one_of(not_correlated_vars$name))
+val_sel$Label <- as.factor(val$Label) # La metemos de nuevo
+head(val_sel)
+```
+
+### PCA
+
+```{r pca-prcomp}
+pca <- prcomp(train[,1:ncol(train)-1], scale=TRUE) # La última columna es la objetivo
+summary(pca)
+```
+
+Visualizamos la proyección
+
+```{r pca-visualizacion}
+library(ggbiplot)
+ggbiplot(pca, groups = as.factor(train$PRI_jet_num), ellipse = TRUE) + 
+scale_colour_manual(name="PRI_jet_num", labels=c(0,1,2,3),  values= c("orange", "lightblue", "green", "red"))
+```
+
+```{r crear train-val}
+train_samples_proj <- predict(pca, train)
+train_pca <- as_tibble(train_samples_proj[,1:10]) %>%
+  mutate(Label = train$Label)
+
+val_samples_proj <- predict(pca, val)
+val_pca <- as_tibble(val_samples_proj[,1:10]) %>%
+  mutate(Label = val$Label)
+
+```
+
+# Clasificación
+
+## Árbol de decisión
+
+```{r my_roc}
+#' Cálculo de valores ROC
+#' @param data Datos originales
+#' @param predictionProb Predicciones
+#' @param target_var Variable objetivo de predicción
+#' @param positive_class Clase positiva de la predicción
+#' 
+#' @return Lista con valores de resultado \code{$auc}, \code{$roc}
+#' 
+#' @examples 
+#' rfModel <- train(Class ~ ., data = train, method = "rf", metric = "ROC", trControl = rfCtrl, tuneGrid = rfParametersGrid)
+#' roc_res <- my_roc(data = validation, predict(rfModel, validation, type = "prob"), "Class", "Good")
+my_roc <- function(data, predictionProb, target_var, positive_class) {
+  auc <- roc(data[[target_var]], predictionProb[[positive_class]], levels = unique(data[[target_var]]))
+  roc <- plot.roc(auc, ylim=c(0,1), type = "S" , print.thres = T, main=paste('AUC:', round(auc$auc[[1]], 2)))
+  return(list("auc" = auc, "roc" = roc))
+}
+```
+
+### Correlación
+
+```{r rpart-crear}
+rpartCtrl <- trainControl(verboseIter = F, 
+                      classProbs = TRUE, 
+                      method = "repeatedcv",
+                      number = 10,
+                      repeats = 1,
+                      summaryFunction = twoClassSummary)
+
+rpartParametersGrid <- expand.grid(.cp = c(0.001, 0.01, 0.1, 0.5))
+```
+
+```{r rpart-entrenar-sel}
+rpartModel_sel <- train(Label ~ ., data = train_sel, method = "rpart", metric = "ROC", trControl = rpartCtrl, tuneGrid = rpartParametersGrid)
+
+```
+
+```{r rpart-sel-plot}
+rpart.plot(rpartModel_sel$finalModel)
+```
+
+```{r rpart-validar-sel}
+rpartModel_sel_roc <- my_roc(val_sel, predict(rpartModel_sel, val_sel, type = "prob"), "Label", "s")
+```
+
+```{r rpart-sel-confmatrix}
+confusionMatrix(predict(rpartModel_sel, val_sel, type = "raw"), val_sel[["Label"]], positive = "s")
+```
+
+### PCA
+
+```{r rpart-entrenar-pca}
+rpartModel_pca <- train(Label ~ ., data = train_pca, method = "rpart", metric = "ROC", trControl = rpartCtrl, tuneGrid = rpartParametersGrid)
+
+```
+
+```{r rpart-pca-plot}
+rpart.plot(rpartModel_pca$finalModel)
+```
+
+```{r rpart-validar-pca}
+rpartModel_pca_roc <- my_roc(val_pca, predict(rpartModel_pca, val_pca, type = "prob"), "Label", "s")
+```
+
+```{r rpart-sel-confmatrix}
+confusionMatrix(predict(rpartModel_pca, val_pca, type = "raw"), val_pca[["Label"]], positive = "s")
+```
+
+## Regresión logística
+
+### Correlación
+
+```{r reg-crear}
+regCtrl <- trainControl(verboseIter = T, 
+                      classProbs = TRUE, 
+                      summaryFunction = twoClassSummary)
+```
+
+```{r reg-entrenar-sel}
+regModel_sel <- train(Label ~ ., data = train_sel, method = "LogitBoost", metric = "ROC", trControl = regCtrl)
+```
+
+```{r reg-validar-sel}
+rregModel_sel_roc <- my_roc(val_sel, predict(regModel_sel, val_sel, type = "prob"), "Label", "s")
+```
+
+```{r reg-sel-confmatrix}
+confusionMatrix(predict(regModel_sel, val_sel, type = "raw"), val_sel[["Label"]], positive = "s")
+```
+### PCA
+
+```{r reg-entrenar-pca}
+regModel_pca <- train(Label ~ ., data = train_pca, method = "LogitBoost", metric = "ROC", trControl = regCtrl)
+```
+
+```{r reg-validar-pca}
+rregModel_pca_roc <- my_roc(val_pca, predict(regModel_pca, val_pca, type = "prob"), "Label", "s")
+```
+
+```{r reg-pca-confmatrix}
+confusionMatrix(predict(regModel_pca, val_pca, type = "raw"), val_pca[["Label"]], positive = "s")
+```
+## Comparación
+
+```{r comparacion1}
+comparison <- tibble(
+  Algoritmo = c('Rpart Sel', 'Rpart PCA', 'LogitBoost Sel', 'LogitBoost PCA'),
+  Descripción = c('', '', '', ''),
+  roc_object = enframe(list(rpartModel_sel_roc$roc, rpartModel_pca_roc$roc, rregModel_sel_roc$roc, rregModel_pca_roc$roc))[[2]],
+  auc_object = enframe(list(rpartModel_sel_roc$auc, rpartModel_pca_roc$auc, rregModel_sel_roc$auc, rregModel_pca_roc$auc))[[2]],
+  auc_value = c(rpartModel_sel_roc$auc$auc[[1]], rpartModel_pca_roc$auc$auc[[1]], rregModel_sel_roc$auc$auc[[1]], rregModel_pca_roc$auc$auc[[1]]),
+  color = c('grey23', 'green1', 'orange1', 'maroon1')
+)
+
+comparison
+```
+
+```{r comparacion2}
+## mostrar curvas en pantalla
+plot <- plot.roc(comparison[1,]$auc_object[[1]], ylim=c(0,1), type = "S", col = comparison[1,]$color)
+
+for(i in 2:nrow(comparison)) {
+  lines.roc(comparison[i,]$auc_object[[1]], type = "S",  col = comparison[i,]$color)
+}
+
+## insertar leyendas
+legend("bottomright", 
+       legend = paste0(comparison$Algoritmo, ", auc=", round(comparison$auc_value, 2)),
+       col = comparison$color,
+       lty = 2,   # tipo de linea
+       lwd = 2)   # grosor de linea 
+```
+
+
